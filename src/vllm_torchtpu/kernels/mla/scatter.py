@@ -70,3 +70,39 @@ def scatter(
         dst_rows,
         name=f"scatter_{spec.cache_type.value}_{spec.layout.value}_cache",
     )
+
+
+def _pack_for(values: jax.Array, spec: kv_cache_utils.SparseMLAKVCacheSpec):
+    if spec.layout is kv_cache_utils.KVCacheLayout.TENSORCORE:
+        return kv_cache_utils.as_token_bytes(values, spec.token_bytes)
+    return kv_cache_utils.pack_tokens(values, spec.token_bytes)
+
+
+def scatter_fused(
+    caches: tuple[jax.Array, ...],
+    values: tuple[jax.Array, ...],
+    specs: tuple[kv_cache_utils.SparseMLAKVCacheSpec, ...],
+    dst_rows: jax.Array,
+) -> tuple[jax.Array, ...]:
+    """`scatter` for several caches sharing `dst_rows`, as ONE SparseCore program.
+
+    Byte-identical to one `scatter` call per (cache, values, spec), but pays the
+    per-program SparseCore dispatch and DMA-in latency once. All specs must
+    share one layout.
+    """
+    assert len(caches) == len(values) == len(specs)
+    layout = specs[0].layout
+    for cache, spec in zip(caches, specs):
+        assert cache.shape == spec.shape and cache.dtype == spec.jax_dtype, (
+            f"cache {cache.shape} {cache.dtype} does not match spec"
+            f" {spec.shape} {spec.jax_dtype}"
+        )
+        assert spec.layout is layout, "scatter_fused needs one layout"
+    srcs = tuple(_pack_for(v, s) for v, s in zip(values, specs))
+    types = "_".join(s.cache_type.value for s in specs)
+    return scatter_utils.scatter_rows_multi(
+        tuple(caches),
+        srcs,
+        dst_rows,
+        name=f"scatter_{types}_{layout.value}_cache",
+    )

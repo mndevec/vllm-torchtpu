@@ -25,6 +25,8 @@ import jax.numpy as jnp
 import torch
 from torch_tpu._internal.pallas import pallas
 
+from vllm_torchtpu import envs
+
 # Both layouts store a token as 32-bit words: the native SparseCore cache holds
 # them as uint32, the TensorCore-tiled cache as WORD_BYTES uint8 rows that
 # `ref.bitcast(jnp.int32)` folds into one word row inside the kernel.
@@ -448,6 +450,21 @@ def _scatter_caches(
     from vllm_torchtpu.kernels.mla import scatter
 
     dst_rows = _dst_rows(page, slot, nope_spec.page_size)
+    if (
+        envs.TPU_MLA_FUSED_SC_CACHE_SCATTER
+        and rope_spec.layout is KVCacheLayout.SPARSECORE
+        and nope_spec.layout is KVCacheLayout.SPARSECORE
+    ):
+        # One SparseCore program writes both caches: the per-program dispatch
+        # and DMA-in latency, which dominates a decode-sized write, is paid
+        # once instead of twice in series.
+        kv_cache_nope, kv_cache_rope = scatter.scatter_fused(
+            (kv_cache_nope, kv_cache_rope),
+            (kv_c_normed, k_pe),
+            (nope_spec, rope_spec),
+            dst_rows,
+        )
+        return kv_cache_nope, kv_cache_rope
     kv_cache_nope = scatter.scatter(
         kv_cache_nope, kv_c_normed, nope_spec, dst_rows=dst_rows
     )
