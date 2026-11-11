@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
-    TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
+    TPU_DCP_LSE_MERGE_A2A_PACK: bool = True
     TPU_DCP_RS_OUT_PRECISION: bool = True
     TPU_MLA_SPARSE_SPLIT_Q: bool = False
     TPU_MLA_FUSED_SC_CACHE_SCATTER: bool = True
@@ -216,11 +216,11 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
-    TPU_FP8_LINEAR_PALLAS: bool = False
-    TPU_FP8_LINEAR_PALLAS_SITES: str = ""
-    TPU_FP8_LINEAR_PALLAS_POST_MOE_FIRST_LAYER: int = 2
+    TPU_FP8_LINEAR_PALLAS: bool = True
+    TPU_FP8_LINEAR_PALLAS_SITES: str = "post_moe:fused_qkv_a_proj"
+    TPU_FP8_LINEAR_PALLAS_POST_MOE_FIRST_LAYER: int = -1
     TPU_FP8_SKINNY_SCALE_DMA: bool = False
-    TPU_FP8_SKINNY_HBM_PIN_SITES: str = ""
+    TPU_FP8_SKINNY_HBM_PIN_SITES: str = "post_moe:fused_qkv_a_proj"
 
 
 def env_with_choices(
@@ -477,7 +477,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # With TPU_DCP_LSE_MERGE_A2A: carry each destination's f32 lse bits as extra
     # int16 rows of its partial-output send block, collapsing two all-to-alls
     # into one. Bit-identical outputs.
-    "TPU_DCP_LSE_MERGE_A2A_PACK": env_bool("TPU_DCP_LSE_MERGE_A2A_PACK", default=False),
+    "TPU_DCP_LSE_MERGE_A2A_PACK": env_bool("TPU_DCP_LSE_MERGE_A2A_PACK", default=True),
     # Backbone MLA merge: reduce-scatter the weighted outputs in the output's
     # precision (bf16), half f32's bytes. MTP drafter stays f32; 0 = f32.
     "TPU_DCP_RS_OUT_PRECISION": env_bool("TPU_DCP_RS_OUT_PRECISION", default=True),
@@ -1347,13 +1347,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
     ),
-    "TPU_FP8_LINEAR_PALLAS": env_bool("TPU_FP8_LINEAR_PALLAS", default=False),
-    "TPU_FP8_LINEAR_PALLAS_SITES": env_str("TPU_FP8_LINEAR_PALLAS_SITES", ""),
-    "TPU_FP8_LINEAR_PALLAS_POST_MOE_FIRST_LAYER": env_nonnegative_int(
-        "TPU_FP8_LINEAR_PALLAS_POST_MOE_FIRST_LAYER", 2
+    "TPU_FP8_LINEAR_PALLAS": env_bool("TPU_FP8_LINEAR_PALLAS", default=True),
+    "TPU_FP8_LINEAR_PALLAS_SITES": env_str(
+        "TPU_FP8_LINEAR_PALLAS_SITES", "post_moe:fused_qkv_a_proj"
+    ),
+    "TPU_FP8_LINEAR_PALLAS_POST_MOE_FIRST_LAYER": env_int(
+        "TPU_FP8_LINEAR_PALLAS_POST_MOE_FIRST_LAYER", -1
     ),
     "TPU_FP8_SKINNY_SCALE_DMA": env_bool("TPU_FP8_SKINNY_SCALE_DMA", default=False),
-    "TPU_FP8_SKINNY_HBM_PIN_SITES": env_str("TPU_FP8_SKINNY_HBM_PIN_SITES", ""),
+    "TPU_FP8_SKINNY_HBM_PIN_SITES": env_str(
+        "TPU_FP8_SKINNY_HBM_PIN_SITES", "post_moe:fused_qkv_a_proj"
+    ),
 }
 
 

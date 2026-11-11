@@ -43,6 +43,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from math import gcd
+import re
 from typing import TYPE_CHECKING, Literal, cast
 
 import torch
@@ -754,6 +755,9 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
                 moe_config = self.get_moe_config(layer)
                 return VllmUnquantizedFusedMoEMethod(moe_config)
             moe_config = self.get_moe_config(layer)
+            m_idx = re.search(r"(?:^|\.)layers\.(\d+)\.", prefix)
+            if m_idx is not None:
+                _record_moe_layer_index(int(m_idx.group(1)))
             return VllmFp8MoEMethodTPU(self, moe_config)
 
         if isinstance(layer, LinearBase):
@@ -1356,12 +1360,18 @@ def _wrap_block_scale_weight_loader(weight_loader: Callable) -> Callable:
     return _wrapped
 
 
-def _prefix_matches_site_token(prefix: str, site: str) -> bool:
-    """Match a "."-bounded suffix OR `post_moe:<suffix>` (layers whose index is at
-    least `TPU_FP8_LINEAR_PALLAS_POST_MOE_FIRST_LAYER`, i.e. preceded by a MoE
-    layer whose gmm_v2 VMEM footprint blocks XLA MSA weight prefetch)."""
-    import re
+_SEEN_MOE_LAYER_INDICES: set[int] = set()
 
+
+def _record_moe_layer_index(idx: int) -> None:
+    _SEEN_MOE_LAYER_INDICES.add(idx)
+
+
+def _prefix_matches_site_token(prefix: str, site: str) -> bool:
+    """Match a "."-bounded suffix OR `post_moe:<suffix>` (layers immediately
+    preceded by a MoE layer whose gmm_v2 VMEM footprint blocks XLA MSA weight
+    prefetch: auto-detected via `(idx - 1) in _SEEN_MOE_LAYER_INDICES` when
+    `TPU_FP8_LINEAR_PALLAS_POST_MOE_FIRST_LAYER < 0`, else `idx >= first_layer`)."""
     if site.startswith("post_moe:"):
         sub = site[len("post_moe:") :].strip()
         if not sub or not (prefix == sub or prefix.endswith("." + sub)):
@@ -1369,7 +1379,11 @@ def _prefix_matches_site_token(prefix: str, site: str) -> bool:
         m = re.search(r"(?:^|\.)layers\.(\d+)\.", prefix)
         if not m:
             return False
-        return int(m.group(1)) >= envs.TPU_FP8_LINEAR_PALLAS_POST_MOE_FIRST_LAYER
+        idx = int(m.group(1))
+        first_layer = envs.TPU_FP8_LINEAR_PALLAS_POST_MOE_FIRST_LAYER
+        if first_layer < 0:
+            return (idx - 1) in _SEEN_MOE_LAYER_INDICES
+        return idx >= first_layer
     return prefix == site or prefix.endswith("." + site)
 
 
