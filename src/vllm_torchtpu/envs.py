@@ -80,6 +80,8 @@ if TYPE_CHECKING:
     TPU_MOE_SINGLE_SORT: bool = True
     TPU_MOE_COUNTING_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
+    TPU_PALLAS_TP_ALL_REDUCE: bool = False
+    TPU_PALLAS_TP_ALL_REDUCE_MAX_TOKENS: int = 32
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -761,6 +763,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # once the path is the default for these layers or is replaced by another
     # fused TP MoE path.
     "USE_MOE_TP_DECODE_KERNEL": env_bool("USE_MOE_TP_DECODE_KERNEL"),
+    # Run the TP all-reduce of RowParallelLinear outputs (MLA o_proj, dense
+    # MLP down_proj) and of the MoE runner's final all-reduce through the
+    # Pallas in-kernel all-reduce (kernels/experimental/moe_tp_decode/
+    # all_reduce.py) instead of XLA's, at token counts up to
+    # TPU_PALLAS_TP_ALL_REDUCE_MAX_TOKENS that the kernel admits (a whole
+    # number of bf16 row tiles, hidden / TP lane-aligned); larger counts run
+    # a psum inside the same op (layers/adapter/pallas_tp_all_reduce.py).
+    # Armed once after load with a start-up self-test; needs the EP mesh over
+    # the whole TP group (dp 1, pcp 1, TP = world). Bf16 inputs only; sums are
+    # f32 in mesh order, so results may differ from XLA's by rounding order.
+    "TPU_PALLAS_TP_ALL_REDUCE": env_bool("TPU_PALLAS_TP_ALL_REDUCE"),
+    # Largest token count TPU_PALLAS_TP_ALL_REDUCE serves with the Pallas
+    # all-reduce. 32 covers decode at max_num_seqs 8 with 3 MTP tokens; the
+    # kernel was measured faster than XLA's all-reduce at 16 rows over 8 ranks.
+    "TPU_PALLAS_TP_ALL_REDUCE_MAX_TOKENS": env_nonnegative_int(
+        "TPU_PALLAS_TP_ALL_REDUCE_MAX_TOKENS", 32
+    ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.

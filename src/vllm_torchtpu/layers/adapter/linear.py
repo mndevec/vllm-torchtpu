@@ -20,6 +20,8 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers.linear import RowParallelLinear
 
+from vllm_torchtpu.layers.adapter import pallas_tp_all_reduce
+
 
 @RowParallelLinear.register_oot
 class TpuRowParallelLinear(RowParallelLinear):
@@ -31,7 +33,8 @@ class TpuRowParallelLinear(RowParallelLinear):
     so adding it afterwards sums the same terms in a different order and keeps
     the graphs identical.
 
-    Only the deferred case is overridden; everything else delegates to
+    Only the deferred case and a layer armed by pallas_tp_all_reduce
+    (TPU_PALLAS_TP_ALL_REDUCE) are overridden; everything else delegates to
     ``super().forward()``.
     """
 
@@ -39,6 +42,8 @@ class TpuRowParallelLinear(RowParallelLinear):
         self,
         input_,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        if pallas_tp_all_reduce.armed_op(self) is not None:
+            return self._forward_pallas_all_reduce(input_)
         defer_bias = (
             self.reduce_results
             and self.tp_size > 1
@@ -64,3 +69,30 @@ class TpuRowParallelLinear(RowParallelLinear):
         if not self.return_bias:
             return output
         return output, None
+
+    def _forward_pallas_all_reduce(
+        self,
+        input_,
+    ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        """Upstream's forward with the TP all-reduce through the armed op (the
+        bias, if any, deferred past it as above). Arming requires
+        reduce_results and tp_size > 1."""
+        if self.input_is_parallel:
+            input_parallel = input_
+        else:
+            split_input = split_tensor_along_last_dim(
+                input_, num_partitions=self.tp_size
+            )
+            input_parallel = split_input[self.tp_rank].contiguous()
+
+        output_parallel = self.quant_method.apply(self, input_parallel, None)
+        output = pallas_tp_all_reduce.all_reduce_tp(self, output_parallel)
+        if output is None:
+            output = tensor_model_parallel_all_reduce(output_parallel)
+        if self.bias is not None and not self.skip_bias_add:
+            output = output + self.bias
+
+        if not self.return_bias:
+            return output
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias

@@ -5937,6 +5937,14 @@ class TPUModelRunner(GPUModelRunner):
             draft = self._async_drafter.draft_model if self._is_async_drafter else None
             arm(self.model, draft)
 
+        # After moe_tp_decode: a layer it armed reduces inside its own op, so
+        # its runner never reaches the final all-reduce this arms.
+        if envs.TPU_PALLAS_TP_ALL_REDUCE:
+            from vllm_torchtpu.layers.adapter import pallas_tp_all_reduce
+
+            draft = self._async_drafter.draft_model if self._is_async_drafter else None
+            pallas_tp_all_reduce.arm(self.model, draft)
+
     def load_lora_model(
         self,
         model: torch.nn.Module,

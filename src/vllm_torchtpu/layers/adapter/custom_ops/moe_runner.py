@@ -28,6 +28,12 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
 from vllm_torchtpu.layers.adapter import expert_placement
 from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 from vllm_torchtpu.layers.adapter.moe_tp_decode import moe_tp_decode_supported
+from vllm_torchtpu.layers.adapter.pallas_tp_all_reduce import (
+    all_reduce_tp as _pallas_all_reduce_tp,
+)
+from vllm_torchtpu.layers.adapter.pallas_tp_all_reduce import (
+    armed_op as _pallas_tp_ar_armed,
+)
 
 # Taken once at import, outside any trace: the MoE forward is traced by
 # torch.compile, and reading the upstream property from inside the trace does
@@ -138,6 +144,39 @@ class VllmMoERunner(MoERunner):
             or adaptive_fused_moe_supported(owner)
             or _upstream_fused_output_is_reduced(self)
         )
+
+    def _maybe_reduce_final_output(
+        self,
+        states,
+        trunc_size,
+        output_is_reduced=None,
+    ):
+        # A layer armed by pallas_tp_all_reduce (TPU_PALLAS_TP_ALL_REDUCE)
+        # runs upstream's late all-reduce, under upstream's conditions, through
+        # its op. Unarmed layers take upstream's method unchanged.
+        if _pallas_tp_ar_armed(self) is None:
+            return super()._maybe_reduce_final_output(
+                states, trunc_size, output_is_reduced
+            )
+        if self.moe_config.skip_final_all_reduce:
+            assert not self._fused_output_is_reduced, (
+                "skip_final_all_reduce requires an un-reduced fused output"
+            )
+        if output_is_reduced is None:
+            output_is_reduced = self._fused_output_is_reduced
+        if (
+            not self.moe_config.is_sequence_parallel
+            and not self.moe_config.skip_final_all_reduce
+            and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
+            and not output_is_reduced
+        ):
+            reduced = _pallas_all_reduce_tp(self, states)
+            states = (
+                reduced
+                if reduced is not None
+                else _moe_runner.tensor_model_parallel_all_reduce(states)
+            )
+        return states[..., :trunc_size] if trunc_size is not None else states
 
     def _fused_ep_owns_pcp_collectives(self) -> bool:
         # The fused EP kernel is armed per layer after checking that layer's
