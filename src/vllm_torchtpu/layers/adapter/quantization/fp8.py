@@ -79,6 +79,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
+from vllm_torchtpu.kernels.quantized_matmul.fp8_skinny import TUNED, padded_n
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
@@ -86,9 +87,15 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     prebuild_fused_moe_kernel,
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
+    FP8_PALLAS_HBM_PIN_ATTR,
+    FP8_PALLAS_N_ATTR,
+    FP8_PALLAS_SCALE,
+    FP8_PALLAS_WEIGHT,
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
+    get_fp8_linear_pallas_op,
     quantized_matmul,
+    quantized_matmul_pallas,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
@@ -760,7 +767,9 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
                 )
 
                 return VllmUnquantizedLinearMethod()
-            return VllmFp8LinearMethodTPU(self, self.get_linear_config(layer))
+            return VllmFp8LinearMethodTPU(
+                self, self.get_linear_config(layer), prefix=prefix
+            )
 
         if isinstance(layer, Attention):
             return None
@@ -1347,6 +1356,68 @@ def _wrap_block_scale_weight_loader(weight_loader: Callable) -> Callable:
     return _wrapped
 
 
+def _prefix_matches_site_token(prefix: str, site: str) -> bool:
+    """Match a "."-bounded suffix OR `post_moe:<suffix>` (layers whose index is at
+    least `TPU_FP8_LINEAR_PALLAS_POST_MOE_FIRST_LAYER`, i.e. preceded by a MoE
+    layer whose gmm_v2 VMEM footprint blocks XLA MSA weight prefetch)."""
+    import re
+
+    if site.startswith("post_moe:"):
+        sub = site[len("post_moe:") :].strip()
+        if not sub or not (prefix == sub or prefix.endswith("." + sub)):
+            return False
+        m = re.search(r"(?:^|\.)layers\.(\d+)\.", prefix)
+        if not m:
+            return False
+        return int(m.group(1)) >= envs.TPU_FP8_LINEAR_PALLAS_POST_MOE_FIRST_LAYER
+    return prefix == site or prefix.endswith("." + site)
+
+
+def _fp8_linear_pallas_selected(prefix: str) -> bool:
+    """TPU_FP8_LINEAR_PALLAS is on and `prefix` matches a listed site."""
+    if not envs.TPU_FP8_LINEAR_PALLAS or not prefix:
+        return False
+    for site in envs.TPU_FP8_LINEAR_PALLAS_SITES.split(","):
+        site = site.strip()
+        if site and _prefix_matches_site_token(prefix, site):
+            return True
+    return False
+
+
+def fp8_skinny_hbm_pin_selected(prefix: str) -> bool:
+    """TPU_FP8_SKINNY_HBM_PIN_SITES lists `prefix`'s site: constrain its
+    fp8_skinny weight operand to HBM."""
+    if not prefix:
+        return False
+    for site in envs.TPU_FP8_SKINNY_HBM_PIN_SITES.split(","):
+        site = site.strip()
+        if site and _prefix_matches_site_token(prefix, site):
+            return True
+    return False
+
+
+def _set_fp8_pallas_copy(layer: torch.nn.Module) -> None:
+    """Build zero-padded K-major copy of a flipped `[n_in, n_out]` weight whose
+    width is not a 128-lane multiple (e.g. qkv_a 2624 -> 2688), leaving the
+    original weight untouched for M > 16 XLA contractions."""
+    weight = cast(torch.Tensor, layer.weight).data
+    scale = cast(torch.Tensor, layer.weight_scale).data
+    n_in, n_out = weight.shape
+    n_pad = padded_n(n_out)
+    raw = torch.zeros(n_in, n_pad, dtype=torch.uint8, device=weight.device)
+    raw[:, :n_out].copy_(weight.contiguous().view(torch.uint8))
+    pad_scale = torch.ones(n_pad, dtype=scale.dtype, device=scale.device)
+    pad_scale[:n_out].copy_(scale)
+    for name, t in (
+        (FP8_PALLAS_WEIGHT, raw.view(weight.dtype)),
+        (FP8_PALLAS_SCALE, pad_scale),
+    ):
+        if hasattr(layer, name):
+            replace_parameter(layer, name, torch.nn.Parameter(t, requires_grad=False))
+        else:
+            layer.register_parameter(name, torch.nn.Parameter(t, requires_grad=False))
+
+
 @register_weight_loader_v2_supported_method
 class VllmFp8LinearMethodTPU(Fp8LinearMethod):
     """
@@ -1638,6 +1709,24 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if hasattr(layer, "weight_scale_inv"):
             delattr(layer, "weight_scale_inv")
         replace_parameter(layer, "weight_scale", weight_scale)
+
+        layer_prefix = getattr(layer, "prefix", "") or self.prefix
+        if (
+            not keep_vllm_layout
+            and weight_scale.ndim == 1
+            and weight_scale.shape[0] == ckpt_n_out
+            and weight.dtype == torch.float8_e4m3fn
+            and (ckpt_n_in, padded_n(ckpt_n_out)) in TUNED
+            and _fp8_linear_pallas_selected(layer_prefix)
+        ):
+            setattr(layer, FP8_PALLAS_N_ATTR, ckpt_n_out)
+            padded_copy = padded_n(ckpt_n_out) != ckpt_n_out
+            if padded_copy:
+                _set_fp8_pallas_copy(layer)
+            hbm_pin = fp8_skinny_hbm_pin_selected(layer_prefix)
+            if hbm_pin:
+                setattr(layer, FP8_PALLAS_HBM_PIN_ATTR, True)
+            get_fp8_linear_pallas_op(padded_copy, hbm_pin)
         # Derive weight_block_size explicitly from weight_scale layout when
         # requant_block_size is unspecified.
         # Setting (1, weight.shape[1]) vs (weight.shape[0], 1) guarantees downstream
@@ -1658,7 +1747,14 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             layer.weight_block_size = requant_block_size
 
         if layer.weight.device.type == "tpu":
-            synchronize_tensors([layer.weight, layer.weight_scale])
+            synchronize_tensors(
+                [layer.weight, layer.weight_scale]
+                + [
+                    getattr(layer, n)
+                    for n in (FP8_PALLAS_WEIGHT, FP8_PALLAS_SCALE)
+                    if hasattr(layer, n)
+                ]
+            )
 
         if self.online_fp8:
             layer._tpu_online_fp8_processed = True
@@ -1686,6 +1782,15 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if isinstance(layer, VocabParallelEmbedding):
             # Prevent the quantization of activations to FP8 (W8A16).
             out = torch.matmul(x, weight.to(x.dtype)) * layer.weight_scale.to(x.dtype)
+        elif getattr(layer, FP8_PALLAS_N_ATTR, None) is not None:
+            out = quantized_matmul_pallas(
+                x,
+                weight,
+                layer.weight_scale,
+                getattr(layer, FP8_PALLAS_WEIGHT, None),
+                getattr(layer, FP8_PALLAS_SCALE, None),
+                hbm_pin=getattr(layer, FP8_PALLAS_HBM_PIN_ATTR, False),
+            )
         else:
             out = quantized_matmul(
                 x,

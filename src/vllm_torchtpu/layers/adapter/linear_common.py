@@ -22,7 +22,9 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
+from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 from vllm_torchtpu.logger import init_logger
 
@@ -51,6 +53,12 @@ KEEP_VLLM_LAYOUT_ATTR = "_tpu_keep_vllm_weight_layout"
 # (`dummy_loader`, `reload/layerwise`), where a second flip would transpose
 # back and silently corrupt the values.
 WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
+# TPU_FP8_LINEAR_PALLAS: logical output width of an armed layer, plus optional
+# zero-padded (k, n_pad) copy when n_out % 128 != 0 (e.g. qkv_a 2624 -> 2688).
+FP8_PALLAS_N_ATTR = "_tpu_fp8_pallas_n_out"
+FP8_PALLAS_WEIGHT = "weight_pallas"
+FP8_PALLAS_SCALE = "weight_scale_pallas"
+FP8_PALLAS_HBM_PIN_ATTR = "_tpu_fp8_pallas_hbm_pin"
 
 
 def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
@@ -183,6 +191,105 @@ def quantized_matmul(
     x_2d = x.reshape(-1, x.shape[-1])
     out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s, w8a16_max_rows)
     return out_2d.reshape(orig_out_shape)
+
+
+def _fp8_linear_pallas(
+    x: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    w_k: jax.Array | None = None,
+    s_k: jax.Array | None = None,
+    *,
+    hbm_pin: bool = False,
+) -> jax.Array:
+    n_out = w_q.shape[1]
+    if w_k is None:
+        kw, ks = w_q, w_s
+    else:
+        assert s_k is not None, "the padded weight w_k comes with its scale s_k"
+        kw, ks = w_k, s_k
+    if fp8_skinny.supports(x.shape[0], kw, ks):
+        return fp8_skinny.fp8_skinny_matmul(
+            x,
+            kw,
+            ks,
+            n_logical=n_out,
+            scale_dma=envs.TPU_FP8_SKINNY_SCALE_DMA
+            and fp8_skinny.scale_dma_applies(*kw.shape),
+            hbm_pin=hbm_pin,
+        )
+    return xla_quantized_matmul(x, w_q, w_s)
+
+
+def _fp8_linear_pallas_jax(
+    x: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    w_k: jax.Array | None = None,
+    s_k: jax.Array | None = None,
+) -> jax.Array:
+    return _fp8_linear_pallas(x, w_q, w_s, w_k, s_k, hbm_pin=False)
+
+
+def _fp8_linear_pallas_hbm_pinned_jax(
+    x: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    w_k: jax.Array | None = None,
+    s_k: jax.Array | None = None,
+) -> jax.Array:
+    return _fp8_linear_pallas(x, w_q, w_s, w_k, s_k, hbm_pin=True)
+
+
+_fp8_linear_pallas_ops: dict[tuple[bool, bool], Callable] = {}
+
+
+def get_fp8_linear_pallas_op(padded_copy: bool, hbm_pin: bool = False) -> Callable:
+    key = (padded_copy, hbm_pin)
+    op = _fp8_linear_pallas_ops.get(key)
+    if op is not None:
+        return op
+    with _quantized_matmul_kernel_op_lock:
+        op = _fp8_linear_pallas_ops.get(key)
+        if op is not None:
+            return op
+        name = "pallas::fp8_linear_pallas" + ("_padded" if padded_copy else "")
+        if hbm_pin:
+            name += "_hbm"
+        fn = _fp8_linear_pallas_hbm_pinned_jax if hbm_pin else _fp8_linear_pallas_jax
+        op = pallas.jax_op(name, fn)
+
+        def _fake(x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor, *rest):
+            del w_s, rest
+            return torch.empty(x.shape[0], w_q.shape[1], dtype=x.dtype, device=x.device)
+
+        op.register_fake(_fake)
+        _fp8_linear_pallas_ops[key] = op
+        return op
+
+
+def quantized_matmul_pallas(
+    x: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    w_kernel: torch.Tensor | None = None,
+    s_kernel: torch.Tensor | None = None,
+    *,
+    hbm_pin: bool = False,
+) -> torch.Tensor:
+    if x.shape[-1] != w_q.shape[0]:
+        raise ValueError(
+            f"Input hidden dim {x.shape[-1]} must match weight hidden dim "
+            f"{w_q.shape[0]}."
+        )
+    x_2d = x.reshape(-1, x.shape[-1])
+    if w_kernel is None:
+        out_2d = get_fp8_linear_pallas_op(False, hbm_pin)(x_2d, w_q, w_s)
+    else:
+        out_2d = get_fp8_linear_pallas_op(True, hbm_pin)(
+            x_2d, w_q, w_s, w_kernel, s_kernel
+        )
+    return out_2d.reshape(*x.shape[:-1], w_q.shape[1])
 
 
 def _quantized_matmul_fp4_jax(
