@@ -452,6 +452,7 @@ def _scatter_caches(
     dst_rows = _dst_rows(page, slot, nope_spec.page_size)
     if (
         envs.TPU_MLA_FUSED_SC_CACHE_SCATTER
+        and kv_c_normed.shape[0] <= envs.TPU_MLA_FUSED_SC_CACHE_SCATTER_MAX_TOKENS
         and rope_spec.layout is KVCacheLayout.SPARSECORE
         and nope_spec.layout is KVCacheLayout.SPARSECORE
     ):

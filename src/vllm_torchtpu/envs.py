@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     TPU_DCP_RS_OUT_PRECISION: bool = True
     TPU_MLA_SPARSE_SPLIT_Q: bool = False
     TPU_MLA_FUSED_SC_CACHE_SCATTER: bool = False
+    TPU_MLA_FUSED_SC_CACHE_SCATTER_MAX_TOKENS: int = 64
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -477,10 +478,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MLA_SPARSE_SPLIT_Q": env_bool("TPU_MLA_SPARSE_SPLIT_Q", default=False),
     # Write the sparse-MLA nope and rope KV cache updates with ONE SparseCore
     # program per layer (`scatter.scatter_fused`) instead of two programs in
-    # series. Byte-identical caches; saves one SC dispatch + DMA-in latency
-    # per layer. Only when both layouts are sparsecore; otherwise ignored.
+    # series, at token counts up to TPU_MLA_FUSED_SC_CACHE_SCATTER_MAX_TOKENS.
+    # Byte-identical caches; saves one SC dispatch + DMA-in latency per layer
+    # on decode-sized steps while leaving large mixed/prefill steps on separate
+    # async programs so XLA overlaps them cleanly. Only when both layouts are
+    # sparsecore; otherwise ignored.
     "TPU_MLA_FUSED_SC_CACHE_SCATTER": env_bool(
         "TPU_MLA_FUSED_SC_CACHE_SCATTER", default=False
+    ),
+    "TPU_MLA_FUSED_SC_CACHE_SCATTER_MAX_TOKENS": env_nonnegative_int(
+        "TPU_MLA_FUSED_SC_CACHE_SCATTER_MAX_TOKENS", 64
     ),
     # QK pair-blocked GDN conv layout for Raiden transfers.  Not supported
     # with the unified GDN state pool: its kernel reads segment-major
