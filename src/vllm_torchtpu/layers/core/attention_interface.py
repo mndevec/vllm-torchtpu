@@ -1240,12 +1240,29 @@ def sparse_mla_attention_dcp(
         else:
             q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}
         # The capped path (and its chunk) applies only where the kernel takes
-        # it: SparseCore caches and a top-k wider than the cap.
-        topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
+        # it: SparseCore caches and a top-k wider than the cap. -1 auto-picks
+        # 2 * (topk // dcp_size) when that is a valid GATHER_ATOM_ROWS-multiple
+        # divisor of topk (e.g. 512 at DCP=8, 256 at DCP=16 for topk=2048).
+        raw_cap = envs.TPU_DCP_MLA_TOPK_CAP
+        topk_width = topk_idx.shape[-1]
+        if raw_cap < 0:
+            auto_cap = 2 * (topk_width // max(1, dcp_size))
+            atom = sparse_mla_kernel.GATHER_ATOM_ROWS
+            topk_cap = (
+                auto_cap
+                if (
+                    0 < auto_cap < topk_width
+                    and auto_cap % atom == 0
+                    and topk_width % auto_cap == 0
+                )
+                else None
+            )
+        else:
+            topk_cap = raw_cap or None
         if not (
             topk_cap
             and cache_layout == sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT
-            and topk_idx.shape[-1] > topk_cap
+            and topk_width > topk_cap
         ):
             topk_cap = None
         chunk_kwargs = (

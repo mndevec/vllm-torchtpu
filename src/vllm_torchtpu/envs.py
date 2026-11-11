@@ -22,13 +22,13 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     TPU_ATTN_MOE_OVERLAP: bool = False
     TPU_K3_SP_PREFILL: bool = False
-    TPU_DCP_MLA_TOPK_CAP: int = 0
+    TPU_DCP_MLA_TOPK_CAP: int = -1
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_DCP_RS_OUT_PRECISION: bool = True
     TPU_MLA_SPARSE_SPLIT_Q: bool = False
-    TPU_MLA_FUSED_SC_CACHE_SCATTER: bool = False
+    TPU_MLA_FUSED_SC_CACHE_SCATTER: bool = True
     TPU_MLA_FUSED_SC_CACHE_SCATTER_MAX_TOKENS: int = 64
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
@@ -82,7 +82,7 @@ if TYPE_CHECKING:
     TPU_MOE_SINGLE_SORT: bool = True
     TPU_MOE_COUNTING_SORT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
-    TPU_PALLAS_TP_ALL_REDUCE: bool = False
+    TPU_PALLAS_TP_ALL_REDUCE: bool = True
     TPU_PALLAS_TP_ALL_REDUCE_MAX_TOKENS: int = 32
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
@@ -136,7 +136,7 @@ if TYPE_CHECKING:
     TPU_SPEC_STATIC_VERIFY: bool = True
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
-    TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
+    TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = 4
     TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
     TPU_STREAMIDX_SMALL_BUCKET_TOKENS: int = 64
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
@@ -453,8 +453,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DCP sparse MLA (SparseCore cache layout): gather and attend this many
     # top-k slots per token instead of all `topk`; tokens owning more are
     # recomputed exactly in-kernel over all their windows
-    # (`sparse_ragged_paged_attention(topk_cap=...)`). Opt-in; 0 = off.
-    "TPU_DCP_MLA_TOPK_CAP": env_int("TPU_DCP_MLA_TOPK_CAP", 0),
+    # (`sparse_ragged_paged_attention(topk_cap=...)`). -1 (default) picks
+    # 2 * (topk // dcp_size) when valid (~2x mean owned slots: 512 at DCP=8,
+    # 256 at DCP=16); 0 disables the cap.
+    "TPU_DCP_MLA_TOPK_CAP": env_int("TPU_DCP_MLA_TOPK_CAP", -1),
     # Gather/attention chunk (query tokens) of the capped path: fewer, larger
     # chunks amortise the per-chunk calls; each chunk's static gather buffer
     # is chunk * topk rows (~335 MB at 256), of which only the live windows
@@ -486,7 +488,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # async programs so XLA overlaps them cleanly. Only when both layouts are
     # sparsecore; otherwise ignored.
     "TPU_MLA_FUSED_SC_CACHE_SCATTER": env_bool(
-        "TPU_MLA_FUSED_SC_CACHE_SCATTER", default=False
+        "TPU_MLA_FUSED_SC_CACHE_SCATTER", default=True
     ),
     "TPU_MLA_FUSED_SC_CACHE_SCATTER_MAX_TOKENS": env_nonnegative_int(
         "TPU_MLA_FUSED_SC_CACHE_SCATTER_MAX_TOKENS", 64
@@ -788,7 +790,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Armed once after load with a start-up self-test; needs the EP mesh over
     # the whole TP group (dp 1, pcp 1, TP = world). Bf16 inputs only; sums are
     # f32 in mesh order, so results may differ from XLA's by rounding order.
-    "TPU_PALLAS_TP_ALL_REDUCE": env_bool("TPU_PALLAS_TP_ALL_REDUCE"),
+    "TPU_PALLAS_TP_ALL_REDUCE": env_bool("TPU_PALLAS_TP_ALL_REDUCE", default=True),
     # Largest token count TPU_PALLAS_TP_ALL_REDUCE serves with the Pallas
     # all-reduce. 32 covers decode at max_num_seqs 8 with 3 MTP tokens; the
     # kernel was measured faster than XLA's all-reduce at 16 rows over 8 ranks.
@@ -1019,10 +1021,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # MIXED-pass query block for StreamIndex top-k token buckets of at most
     # TPU_STREAMIDX_SMALL_BUCKET_TOKENS. Under MTP every decode request has
     # q_len = gamma + 1 and runs in the MIXED pass, whose default 128-row block
-    # scores ~124 padding rows per request. 4 is the recommended value. Unset
+    # scores ~124 padding rows per request. 4 is the default; 0 disables and
     # keeps 128 everywhere.
-    "TPU_STREAMIDX_SMALL_BUCKET_BQ": env_positive_int_or_none(
-        "TPU_STREAMIDX_SMALL_BUCKET_BQ"
+    "TPU_STREAMIDX_SMALL_BUCKET_BQ": (
+        lambda: (
+            None
+            if (v := env_nonnegative_int("TPU_STREAMIDX_SMALL_BUCKET_BQ", 4)()) == 0
+            else v
+        )
     ),
     # MIXED-pass KV pages per block for those buckets; unset takes 8. Read only
     # when TPU_STREAMIDX_SMALL_BUCKET_BQ is set.
