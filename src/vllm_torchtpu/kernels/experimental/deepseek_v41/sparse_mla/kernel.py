@@ -570,9 +570,8 @@ def _extract_swa_windows_2d(
         meta_ref: Any,
         packed_swa_ref: Any,
         out_ref: Any,
-        prefix_scr_ref: Any,
-        current_scr_ref: Any,
-        dma_sem: Any,
+        window_scr_ref: Any,
+        dma_sems: Any,
     ) -> None:
         token_idx = pl.program_id(0)
         prefix_row = meta_ref[0, token_idx]
@@ -583,21 +582,31 @@ def _extract_swa_windows_2d(
         )
         use_prefix = window_iota < (swa_width - 1 - delta_token)
         valid_window = window_iota < swa_width
+        # Issue all BF16_PER_WORD x {prefix, current} window DMAs before waiting on any,
+        # so their HBM latencies overlap instead of adding up (slot = 2 * half + src).
+        copies = []
         for half_idx in range(BF16_PER_WORD):
-            for row_offset, scratch_ref in (
-                (prefix_row + half_idx * half_stride, prefix_scr_ref),
-                (current_row + half_idx * half_stride, current_scr_ref),
-            ):
+            for src_idx, base_row in enumerate((prefix_row, current_row)):
+                slot = 2 * half_idx + src_idx
                 copy_desc = pltpu.make_async_copy(
-                    packed_swa_ref.at[pl.ds(row_offset, padded_swa_width), :],
-                    scratch_ref,
-                    dma_sem,
+                    packed_swa_ref.at[
+                        pl.ds(base_row + half_idx * half_stride, padded_swa_width), :
+                    ],
+                    window_scr_ref.at[slot],
+                    dma_sems.at[slot],
                 )
                 copy_desc.start()
-                copy_desc.wait()
+                copies.append(copy_desc)
+        for half_idx in range(BF16_PER_WORD):
+            copies[2 * half_idx].wait()
+            copies[2 * half_idx + 1].wait()
             merged_words = jnp.where(
                 valid_window,
-                jnp.where(use_prefix, prefix_scr_ref[...], current_scr_ref[...]),
+                jnp.where(
+                    use_prefix,
+                    window_scr_ref[2 * half_idx],
+                    window_scr_ref[2 * half_idx + 1],
+                ),
                 0,
             )
             out_ref[
@@ -613,13 +622,16 @@ def _extract_swa_windows_2d(
         (1, BF16_PER_WORD * padded_swa_width, ROW_WORDS),
         lambda token_idx, _meta_ref: (token_idx, 0, 0),
     )
-    vmem_scratch = pltpu.VMEM((padded_swa_width, ROW_WORDS), jnp.int32)
+    num_window_dmas = 2 * BF16_PER_WORD
+    vmem_scratch = pltpu.VMEM(
+        (num_window_dmas, padded_swa_width, ROW_WORDS), jnp.int32
+    )
     grid_spec = pltpu.PrefetchScalarGridSpec(
         1,
         (chunk_tokens,),
         [_HBM_SPEC],
         out_spec,
-        [vmem_scratch, vmem_scratch, pltpu.SemaphoreType.DMA],
+        [vmem_scratch, pltpu.SemaphoreType.DMA((num_window_dmas,))],
     )
     extracted = _pallas(
         _extract_windows_kernel,
