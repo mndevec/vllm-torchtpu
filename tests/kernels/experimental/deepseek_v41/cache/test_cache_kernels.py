@@ -804,3 +804,76 @@ def test_gather_cache_rows_tpu(use_pool_hi: bool) -> None:
     )
     expected = _ref_gather_cache_rows(pool_lo_np, idx_np, pool_hi=pool_hi_np)
     np.testing.assert_array_equal(got, expected)
+
+
+def _padded_slot_window_indices(
+    rng: np.random.Generator, num_rows: int, live_slots: list[bool]
+) -> np.ndarray:
+    """SWA-style row indices: 256 rows per request slot, all -1 for empty slots.
+
+    Live slots read 8 unaligned 32-row page runs from random pages, so 32-row
+    output chunks straddle pages (scattered path) while empty slots are whole
+    all-negative chunks (the skipped path).
+    """
+    parts = []
+    for live in live_slots:
+        if not live:
+            parts.append(np.full((256,), -1, dtype=np.int32))
+            continue
+        start = int(rng.integers(0, 32))
+        pages = rng.choice(num_rows // 32, size=9, replace=False)
+        rows = np.concatenate([p * 32 + np.arange(32) for p in pages])[start:]
+        parts.append(rows[:256].astype(np.int32))
+    return np.concatenate(parts)
+
+
+@pytest.mark.parametrize("use_pool_hi", [False, True])
+def test_gather_cache_rows_skips_empty_slots_cpu_interpret(use_pool_hi: bool) -> None:
+    rng = np.random.default_rng(900 + int(use_pool_hi))
+    num_rows = 32 * 12
+    pool_lo_np = rng.integers(-1000, 1000, size=(num_rows, ROW_WORDS), dtype=np.int32)
+    pool_hi_np = (
+        rng.integers(-1000, 1000, size=(num_rows, ROW_WORDS), dtype=np.int32)
+        if use_pool_hi
+        else None
+    )
+    total_rows = num_rows * (2 if use_pool_hi else 1)
+    idx_np = _padded_slot_window_indices(
+        rng, total_rows, [True, False, True, False, False, True, False, False]
+    )
+    got = np.asarray(
+        gather_cache_rows(
+            jnp.asarray(pool_lo_np),
+            jnp.asarray(idx_np),
+            pool_hi=None if pool_hi_np is None else jnp.asarray(pool_hi_np),
+            interpret=True,
+        )
+    )
+    expected = _ref_gather_cache_rows(pool_lo_np, idx_np, pool_hi=pool_hi_np)
+    np.testing.assert_array_equal(got, expected)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("use_pool_hi", [False, True])
+def test_gather_cache_rows_skips_empty_slots_tpu(use_pool_hi: bool) -> None:
+    rng = np.random.default_rng(950 + int(use_pool_hi))
+    num_rows = 32 * 64
+    pool_lo_np = rng.integers(-1000, 1000, size=(num_rows, ROW_WORDS), dtype=np.int32)
+    pool_hi_np = (
+        rng.integers(-1000, 1000, size=(num_rows, ROW_WORDS), dtype=np.int32)
+        if use_pool_hi
+        else None
+    )
+    total_rows = num_rows * (2 if use_pool_hi else 1)
+    live = [i % 2 == 0 for i in range(16)]
+    idx_np = _padded_slot_window_indices(rng, total_rows, live)
+    got = np.asarray(
+        gather_cache_rows(
+            jnp.asarray(pool_lo_np),
+            jnp.asarray(idx_np),
+            pool_hi=None if pool_hi_np is None else jnp.asarray(pool_hi_np),
+            interpret=False,
+        )
+    )
+    expected = _ref_gather_cache_rows(pool_lo_np, idx_np, pool_hi=pool_hi_np)
+    np.testing.assert_array_equal(got, expected)

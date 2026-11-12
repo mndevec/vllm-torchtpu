@@ -108,6 +108,7 @@ MAX_PACK_TILE = 512
 MAX_GATHER_BLOCK = 2048
 GATHER_PAGE_BURST_ROWS = 32
 GATHER_SUB_BURST_ROWS = 8
+PAGE_CHUNK_SKIP_MODE = 3  # all-negative 32-row chunk: no DMA, stays zero.
 GATHER_SUB_CHUNKS_PER_PAGE = GATHER_PAGE_BURST_ROWS // GATHER_SUB_BURST_ROWS
 # Caps single-block rows at padded_queries // 8 when multi-block to balance parallelism.
 GATHER_BLOCK_DIVISOR_SHIFT = 3  # log2(8) multi-block row divisor shift.
@@ -861,10 +862,17 @@ def gather_cache_rows(
     )
     rows_hi = 0 if pool_hi is None else pool_hi.shape[0]
     pool_hi_arg = pool_lo[:1] if pool_hi is None else pool_hi
-    page_chunk_modes = _contig_mode(
-        padded_indices.reshape(num_blocks, num_page_chunks, GATHER_PAGE_BURST_ROWS),
-        rows_lo,
-        rows_hi,
+    page_chunk_indices = padded_indices.reshape(
+        num_blocks, num_page_chunks, GATHER_PAGE_BURST_ROWS
+    )
+    page_chunk_modes = _contig_mode(page_chunk_indices, rows_lo, rows_hi)
+    # A 32-row chunk whose indices are all negative (padded request slots) reads
+    # nothing; the output is zero-initialized, so mark it skipped instead of letting
+    # it fall to the 8-row / 1-row scattered path (scalar issue+wait loops per row).
+    page_chunk_modes = jnp.where(
+        jnp.all(page_chunk_indices < 0, axis=2),
+        PAGE_CHUNK_SKIP_MODE,
+        page_chunk_modes,
     )
     sub_chunk_modes_raw = _contig_mode(
         padded_indices.reshape(num_blocks, num_sub_chunks, GATHER_SUB_BURST_ROWS),
@@ -893,7 +901,8 @@ def gather_cache_rows(
 
     # SMEM meta_ref layout (padded to meta_cols):
     #   meta_ref[0] = has_non_page_chunks (1 if any 32-row chunk needs sub-8/1-row),
-    #   meta_ref[1 .. 1+num_page_chunks] = page_chunk_modes (0: sub-8, 1: lo, 2: hi),
+    #   meta_ref[1 .. 1+num_page_chunks] = page_chunk_modes (0: sub-8, 1: lo, 2: hi,
+    #       3: all-negative, skipped),
     #   meta_ref[1+num_page_chunks .. indices_smem_offset] = sub_chunk_modes
     #       (0: 1-row, 1: lo, 2: hi, 3: covered by page_chunk_modes),
     #   meta_ref[indices_smem_offset .. indices_smem_offset+block_rows] = indices.
