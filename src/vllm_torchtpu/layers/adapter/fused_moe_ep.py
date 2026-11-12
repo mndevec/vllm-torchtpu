@@ -648,13 +648,23 @@ def register_fused_scale_buffers(layer) -> None:
     the step. So each table is copied once into a base tensor of its own, and
     the 4-D parameter becomes a view of that copy rather than a second one.
     The tables are synced here because the loaders' own sync has already run.
+    On TPU each table is staged through host memory first so its buffer has
+    the default row-major layout the kernel reads, not the quantizer's
+    transposed one (which cost a relayout copy per layer per step).
     """
     tables = []
     for param, buf in (
         ("w13_weight_scale", "_tpu_fused_w13_scale"),
         ("w2_weight_scale", "_tpu_fused_w2_scale"),
     ):
-        table = fresh_buffer(getattr(layer, param).squeeze(2))
+        table = getattr(layer, param).squeeze(2)
+        if table.device.type == "tpu":
+            # The quantizer's program hands the table back in a transposed
+            # physical layout ({2,0,1}); fresh_buffer keeps it, so XLA copied
+            # it into the kernel's row-major layout on every layer of every
+            # step. A host round trip lands it in the default layout once.
+            table = table.cpu().to(table.device)
+        table = fresh_buffer(table)
         layer.register_buffer(buf, table, persistent=False)
         setattr(
             layer, param, torch.nn.Parameter(table.unsqueeze(2), requires_grad=False)
