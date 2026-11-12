@@ -224,6 +224,38 @@ class TpuDPSharedEngramStorage(upstream.DPSharedEngramStorage):
         return self.weight, self.weight_scale_inv
 
 
+def write_hash_slots(
+    cache: Tensor,
+    slots: Tensor,
+    values: Tensor,
+    valid: Tensor,
+    *,
+    has_null_block: bool,
+) -> None:
+    """Write n-gram history ``values`` into the 1-D slot ``cache`` where ``valid``.
+
+    ``write_cache``'s dense path boolean-indexes by ``valid`` (``nonzero`` +
+    ``index``, twice). Engram hashing runs eagerly before the forward, so each
+    of those is a blocking device->host sync on the step's critical path. With
+    a null block, invalid rows (exactly the slots inside block 0) are routed to
+    slot 0 instead: block 0 is never read back (``fallback_slot_lookup`` masks
+    ``blocks < min_block`` to ``DEAD_ID``), so one sync-free ``index_put_``
+    leaves the same readable state.
+
+    Args:
+        cache: ``int32[num_slots]`` slot-keyed hash history (Changed).
+        slots: ``int32[num_tokens]`` flat slot indices (Used).
+        values: ``int32[num_tokens]`` mapped token ids to record (Used).
+        valid: ``bool[num_tokens]`` rows to record (Used).
+        has_null_block: Whether block 0 is the SWA cache's null block.
+    """
+    if not has_null_block:
+        write_cache(cache, slots, values, valid)
+        return
+    write_slots = torch.where(valid, slots, torch.zeros_like(slots))
+    cache.index_put_((write_slots.long(),), values[: write_slots.shape[0]])
+
+
 class NgramHashState(upstream.NgramHashState):
     """Subclass upstream ``NgramHashState`` replacing Triton kernels with PyTorch.
 
@@ -325,8 +357,12 @@ class NgramHashState(upstream.NgramHashState):
             slots = slot_mapping[:token_count]
             mapped_raw = self.token_map.index_select(0, input_ids.int())
             mapped_batch = mapped_raw.masked_fill(dead_mask, upstream.DEAD_ID)
-            write_cache(
-                self._cache, slots, mapped_batch, slots >= min_block * self.block_size
+            write_hash_slots(
+                self._cache,
+                slots,
+                mapped_batch,
+                slots >= min_block * self.block_size,
+                has_null_block=has_null_block,
             )
 
         def fallback_slot_lookup(past: Tensor, reqs: Tensor, window: Tensor) -> Tensor:

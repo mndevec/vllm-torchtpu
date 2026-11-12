@@ -702,3 +702,28 @@ def test_tpu_engram_dequant_and_forward(
         assert eng_tpu._active_staged is not None
         got_b = eng_tpu(x_b.to(dev), h_b.to(dev)).cpu()
         torch.testing.assert_close(got_b, ref_b, rtol=1.6e-2, atol=1.6e-2)
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_write_hash_slots_null_block_matches_write_cache(seed: int) -> None:
+    """Sync-free null-block writes leave the readable slots (block >= 1) unchanged."""
+    gen = torch.Generator().manual_seed(seed)
+    block, num_blocks, num_tokens = 8, 6, 40
+    base = torch.randint(0, 1000, (block * num_blocks,), generator=gen, dtype=torch.int32)
+    # Distinct live slots in blocks >= 1, plus padded rows in block 0 and at -1.
+    live = torch.randperm(block * (num_blocks - 1), generator=gen)[: num_tokens - 10]
+    live = (live + block).to(torch.int32)
+    padded = torch.tensor([0, 1, 3, 7, 0, -1, -1, 5, 2, -1], dtype=torch.int32)
+    slots = torch.cat([live, padded])[torch.randperm(num_tokens, generator=gen)]
+    values = torch.randint(0, 1000, (num_tokens,), generator=gen, dtype=torch.int32)
+    valid = slots >= block
+
+    got = base.clone()
+    engram_mod.write_hash_slots(got, slots, values, valid, has_null_block=True)
+    want = base.clone()
+    engram_mod.write_cache(want, slots, values, valid)
+    assert torch.equal(got[block:], want[block:])
+
+    plain = base.clone()
+    engram_mod.write_hash_slots(plain, slots, values, valid, has_null_block=False)
+    assert torch.equal(plain, want)
