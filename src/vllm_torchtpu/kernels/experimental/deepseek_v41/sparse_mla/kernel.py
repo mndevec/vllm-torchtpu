@@ -574,38 +574,59 @@ def _extract_swa_windows_2d(
         dma_sems: Any,
     ) -> None:
         token_idx = pl.program_id(0)
-        prefix_row = meta_ref[0, token_idx]
-        current_row = meta_ref[1, token_idx]
+        num_tokens = pl.num_programs(0)
         delta_token = meta_ref[2, token_idx]
         window_iota = jax.lax.broadcasted_iota(
             jnp.int32, (padded_swa_width, ROW_WORDS), 0
         )
         use_prefix = window_iota < (swa_width - 1 - delta_token)
         valid_window = window_iota < swa_width
-        # Issue all BF16_PER_WORD x {prefix, current} window DMAs before waiting on any,
-        # so their HBM latencies overlap instead of adding up (slot = 2 * half + src).
-        copies = []
-        for half_idx in range(BF16_PER_WORD):
-            for src_idx, base_row in enumerate((prefix_row, current_row)):
-                slot = 2 * half_idx + src_idx
-                copy_desc = pltpu.make_async_copy(
-                    packed_swa_ref.at[
-                        pl.ds(base_row + half_idx * half_stride, padded_swa_width), :
-                    ],
-                    window_scr_ref.at[slot],
-                    dma_sems.at[slot],
-                )
+
+        # Two buffer sets of 2 halves x {prefix, current}; the grid is sequential
+        # (ARBITRARY), so token t+1's window DMAs are issued before token t waits,
+        # hiding their HBM latency behind token t's merge and output writeback.
+        def _window_copies(tok: Any, buf: Any) -> list[Any]:
+            copies = []
+            for half_idx in range(BF16_PER_WORD):
+                for src_idx in range(2):
+                    base_row = meta_ref[src_idx, tok]
+                    slot = 2 * half_idx + src_idx
+                    copies.append(
+                        pltpu.make_async_copy(
+                            packed_swa_ref.at[
+                                pl.ds(
+                                    base_row + half_idx * half_stride, padded_swa_width
+                                ),
+                                :,
+                            ],
+                            window_scr_ref.at[buf, slot],
+                            dma_sems.at[buf, slot],
+                        )
+                    )
+            return copies
+
+        buf = token_idx % 2
+
+        @pl.when(token_idx == 0)
+        def _prime() -> None:
+            for copy_desc in _window_copies(token_idx, buf):
                 copy_desc.start()
-                copies.append(copy_desc)
+
+        @pl.when(token_idx + 1 < num_tokens)
+        def _prefetch_next() -> None:
+            for copy_desc in _window_copies(token_idx + 1, 1 - buf):
+                copy_desc.start()
+
+        current = _window_copies(token_idx, buf)
         for half_idx in range(BF16_PER_WORD):
-            copies[2 * half_idx].wait()
-            copies[2 * half_idx + 1].wait()
+            current[2 * half_idx].wait()
+            current[2 * half_idx + 1].wait()
             merged_words = jnp.where(
                 valid_window,
                 jnp.where(
                     use_prefix,
-                    window_scr_ref[2 * half_idx],
-                    window_scr_ref[2 * half_idx + 1],
+                    window_scr_ref[buf, 2 * half_idx],
+                    window_scr_ref[buf, 2 * half_idx + 1],
                 ),
                 0,
             )
@@ -624,14 +645,14 @@ def _extract_swa_windows_2d(
     )
     num_window_dmas = 2 * BF16_PER_WORD
     vmem_scratch = pltpu.VMEM(
-        (num_window_dmas, padded_swa_width, ROW_WORDS), jnp.int32
+        (2, num_window_dmas, padded_swa_width, ROW_WORDS), jnp.int32
     )
     grid_spec = pltpu.PrefetchScalarGridSpec(
         1,
         (chunk_tokens,),
         [_HBM_SPEC],
         out_spec,
-        [vmem_scratch, pltpu.SemaphoreType.DMA((num_window_dmas,))],
+        [vmem_scratch, pltpu.SemaphoreType.DMA((2, num_window_dmas))],
     )
     extracted = _pallas(
         _extract_windows_kernel,
