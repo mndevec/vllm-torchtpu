@@ -1422,9 +1422,13 @@ def _set_fp8_pallas_copy(layer: torch.nn.Module) -> None:
     raw[:, :n_out].copy_(weight.contiguous().view(torch.uint8))
     pad_scale = torch.ones(n_pad, dtype=scale.dtype, device=scale.device)
     pad_scale[:n_out].copy_(scale)
+    # `raw.view(fp8)` is a dtype view of a uint8 buffer: torch_tpu would
+    # re-materialize it as a `tt_jit_execute_as_strided` program before every
+    # forward (one per armed layer, ~1 ms/step on GLM-5.2 E2E j-10c76927).
+    # fresh_buffer gives each persistent tensor a buffer of its own dtype/shape.
     for name, t in (
-        (FP8_PALLAS_WEIGHT, raw.view(weight.dtype)),
-        (FP8_PALLAS_SCALE, pad_scale),
+        (FP8_PALLAS_WEIGHT, fresh_buffer(raw.view(weight.dtype))),
+        (FP8_PALLAS_SCALE, fresh_buffer(pad_scale)),
     ):
         if hasattr(layer, name):
             replace_parameter(layer, name, torch.nn.Parameter(t, requires_grad=False))
