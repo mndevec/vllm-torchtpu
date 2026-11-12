@@ -237,10 +237,11 @@ def write_hash_slots(
     ``write_cache``'s dense path boolean-indexes by ``valid`` (``nonzero`` +
     ``index``, twice). Engram hashing runs eagerly before the forward, so each
     of those is a blocking device->host sync on the step's critical path. With
-    a null block, invalid rows (exactly the slots inside block 0) are routed to
-    slot 0 instead: block 0 is never read back (``fallback_slot_lookup`` masks
-    ``blocks < min_block`` to ``DEAD_ID``), so one sync-free ``index_put_``
-    leaves the same readable state.
+    a null block, every invalid row's slot lies inside block 0 (or is negative)
+    while every valid slot lies in block >= 1, so the two sets cannot collide:
+    invalid rows write back the value already held at their (clamped) slot,
+    and one sync-free ``index_put_`` leaves the cache, null block included,
+    exactly as ``write_cache`` would.
 
     Args:
         cache: ``int32[num_slots]`` slot-keyed hash history (Changed).
@@ -252,8 +253,11 @@ def write_hash_slots(
     if not has_null_block:
         write_cache(cache, slots, values, valid)
         return
-    write_slots = torch.where(valid, slots, torch.zeros_like(slots))
-    cache.index_put_((write_slots.long(),), values[: write_slots.shape[0]])
+    safe_slots = slots.clamp(0, cache.numel() - 1)
+    keep = cache.index_select(0, safe_slots)
+    write_values = torch.where(valid, values[: slots.shape[0]], keep)
+    write_slots = torch.where(valid, slots, safe_slots)
+    cache.index_put_((write_slots.long(),), write_values)
 
 
 class NgramHashState(upstream.NgramHashState):

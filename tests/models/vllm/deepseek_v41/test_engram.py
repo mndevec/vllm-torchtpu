@@ -706,7 +706,7 @@ def test_tpu_engram_dequant_and_forward(
 
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_write_hash_slots_null_block_matches_write_cache(seed: int) -> None:
-    """Sync-free null-block writes leave the readable slots (block >= 1) unchanged."""
+    """Sync-free null-block writes match write_cache, null block included."""
     gen = torch.Generator().manual_seed(seed)
     block, num_blocks, num_tokens = 8, 6, 40
     base = torch.randint(0, 1000, (block * num_blocks,), generator=gen, dtype=torch.int32)
@@ -722,7 +722,7 @@ def test_write_hash_slots_null_block_matches_write_cache(seed: int) -> None:
     engram_mod.write_hash_slots(got, slots, values, valid, has_null_block=True)
     want = base.clone()
     engram_mod.write_cache(want, slots, values, valid)
-    assert torch.equal(got[block:], want[block:])
+    assert torch.equal(got, want)
 
     plain = base.clone()
     engram_mod.write_hash_slots(plain, slots, values, valid, has_null_block=False)
